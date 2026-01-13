@@ -1,15 +1,30 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
+
 from triton.tools.ragged_tma import create_ragged_descriptor
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from .target_info import cuda_capability_geq
 from .tensor_details import bitmatrix as bitmatrix_details
 from .tensor_details import ragged_tensor as ragged_tensor_details
+from .tensor_details.dtype import (
+    BF16,
+    FP4,
+    FP8_E4M3FN,
+    FP8_E4M3FNUZ,
+    FP8_E5M2,
+    FP16,
+    FP32,
+    FP64,
+    UINT8,
+    DataType,
+    FloatType,
+    IntegerType,
+)
 from .tensor_details.layout import BlackwellMXValueLayout, Layout, StridedLayout
 from .tensor_details.ragged_tensor import RaggedTensorMetadata
-from .tensor_details.dtype import IntegerType, FloatType, DataType, FP4, UINT8, FP8_E4M3FN, FP8_E4M3FNUZ, FP8_E5M2, FP16, BF16, FP32, FP64
+from .tensor_details.sharding import Sharding
 
 
 # storage
@@ -27,37 +42,72 @@ class Storage:
 # main tensor class
 # ---------------------------------------------------------------------------- #
 
+# We only support sharding across one single dimension.
+# This can eventually be relaxed, but we have to agree on one consistent story about how to map
+# shards to ranks across dimensions.
+
+
+@dataclass
+class TensorSharding:
+    dim: int
+    sharding: Sharding
+
 
 @dataclass
 class Tensor:
     storage: Storage
     dtype: IntegerType | FloatType
-    shape: list[int] | None = None
-    shape_max: list[int] | None = None
+    shape: list[int | torch.Tensor]
+    shape_max: list[int | None] | None = None
+    sharding: TensorSharding | None
+    is_ragged: bool = field(init=False, default=False)
 
     def __post_init__(self):
         assert isinstance(self.storage, Storage)
-        # initialize dtype
-        if self.dtype.bitwidth < 8 and self.shape is None:
-            raise ValueError("shape must be provided for sub-byte types")
+
         # initialize shape
         if self.shape is None:
-            self.shape = list(self.storage.data.shape)
+            if self.dtype.bitwidth < 8:
+                raise ValueError("shape must be provided for sub-byte types")
+            if self.sharding is not None:
+                raise ValueError("shape must be provided if sharding")
+            self.shape = self.storage.data.shape
+
         self.shape = list(self.shape)
+
         # validate shape: all elements must be `int` or numel-1 `torch.Tensor`
         is_int = lambda s: isinstance(s, int)
         is_item = lambda s: hasattr(s, "numel") and s.numel() == 1
-        assert all(map(lambda s: is_int(s) or is_item(s), self.shape))
+        assert all(is_int(s) or is_item(s) for s in self.shape)
+
         # initialize shape_max
         if self.shape_max is None:
             self.shape_max = [None] * len(self.shape)
+        elif len(self.shape) != len(self.shape_max):
+            raise ValueError(
+                f"Mismatched shape ({len(self.shape)}) / shape_max ({len(self.shape_max)}) lengths"
+            )
+
+        # The tensor is ragged if shape and shape_max don't match, either because, for some i,
+        # shape[i] < shape_max[i], or because shape[i] is not known statically. In either case,
+        # we'll need to use kernels that support raggedness (or explicitly don't care that they're
+        # wasting work by operating on the full shape_max / padded size)
+
+        is_ragged = False
         for i, (s, smax) in enumerate(zip(self.shape, self.shape_max)):
-            if smax is not None and not is_int(smax):
-                raise ValueError(f"shape_max[{i}] must be `int` or `None`; got {type(smax)}")
             if smax is None:
+                if not is_int(s):
+                    raise ValueError(f"shape_max[{i}] may only be None for static shapes")
                 self.shape_max[i] = s
-        # validate shape_max: all elements must be `int`
-        assert all(map(is_int, self.shape_max))
+            elif is_int(s):
+                if s > smax:
+                    raise ValueError(f"shape[{i}]={s} > shape_max[{i}]={smax}")
+                if s < smax:
+                    is_ragged = True
+            else:
+                is_ragged = True
+
+        self.is_ragged = is_ragged
 
     # torch compatibility layer
     @property
@@ -81,9 +131,8 @@ class Tensor:
         return self.dtype.bitwidth // 8
 
     @property
-    def data(self):
-        t = self.storage
-        return t.data if isinstance(t, Storage) else t
+    def data(self) -> torch.Tensor:
+        return self.storage.data
 
     def dim(self):
         return self.ndim
@@ -132,7 +181,8 @@ def make_dense_tma(tensor, block_shape, is_scale):
         block_shape[indx] = block_shape[indx] // 2
         if isinstance(storage.layout, BlackwellMXValueLayout) and shape[-1] % 128 != 0:
             raise ValueError(
-                "inner shape need to be multiple of 128 for mxfp4 (CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B) TMAs.")
+                "inner shape need to be multiple of 128 for mxfp4 (CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B) TMAs."
+            )
     return TensorDescriptor(storage.data, shape, strides, block_shape)
 
 
@@ -208,7 +258,9 @@ def wrap_torch_tensor(torch_tensor, dtype=None, shape=None, shape_max=None, layo
     if shape is None:
         shape = list(torch_tensor.shape)
         if dtype == FP4:
-            shape[torch_tensor.stride().index(1)] *= (8 * torch_tensor.dtype.itemsize) // dtype.bitwidth
+            shape[torch_tensor.stride().index(1)] *= (
+                8 * torch_tensor.dtype.itemsize
+            ) // dtype.bitwidth
     if shape_max is None:
         shape_max = list(shape)
     if layout is None:
@@ -225,7 +277,9 @@ def convert_layout(tensor: Tensor, layout: Layout, **layout_transformation_kwarg
     transformation = tensor.storage.layout.make_transformation(shape, tensor.dtype == FP4)
     canonical_data = transformation.unswizzle_data(tensor.storage.data)
     # convert canonical form to `layout`
-    transformation = layout.make_transformation(shape, tensor.dtype == FP4, **layout_transformation_kwargs)
+    transformation = layout.make_transformation(
+        shape, tensor.dtype == FP4, **layout_transformation_kwargs
+    )
     # print("convert layout ", torch.cuda.memory_summary(0, abbreviated=True))
     new_data = transformation.swizzle_data(canonical_data)
     return Tensor(Storage(new_data, layout), shape=list(tensor.shape), dtype=tensor.dtype)
