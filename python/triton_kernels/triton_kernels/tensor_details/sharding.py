@@ -15,6 +15,9 @@ class ShardLocation:
 
 @dataclass(frozen=True, kw_only=True)
 class Sharding(ABC):
+    # Size (aka 1 + max index) along the sharding dimension, used to statically determine
+    # shard boundaries.
+    size: int
     process_group: ProcessGroup = field(default_factory=default_process_group)
 
     @abstractmethod
@@ -38,10 +41,10 @@ class Sharding(ABC):
 
 @dataclass(frozen=True, kw_only=True)
 class LocalSharding(Sharding):
-    def full_map(self, size: int) -> Sequence[ShardLocation]:
-        return (ShardLocation(shard=slice(0, size)),)
+    def full_map(self) -> Sequence[ShardLocation]:
+        return (ShardLocation(shard=slice(0, self.size)),)
 
-    def map(self, idxs: torch.Tensor, size: int) -> torch.Tensor:
+    def map(self, idxs: torch.Tensor) -> torch.Tensor:
         my_rank = self.process_group.rank
         ranks = torch.full_like(idxs, my_rank)
         return torch.stack((ranks, idxs), dim=1).unsqueeze(0)
@@ -70,8 +73,8 @@ class RangeSharding(Sharding):
     def __post_init__(self):
         assert self.process_group.world_size % self.replication_factor == 0
 
-    def full_map(self, size: int) -> Sequence[ShardLocation]:
-        q, r = divmod(size, self.n_shards)
+    def full_map(self) -> Sequence[ShardLocation]:
+        q, r = divmod(self.size, self.n_shards)
         locations = []
         start = 0
         for shard in range(self.n_shards):
@@ -86,11 +89,11 @@ class RangeSharding(Sharding):
             start = end
         return locations
 
-    def map(self, idxs: torch.Tensor, size: int) -> Sequence[torch.Tensor]:
+    def map(self, idxs: torch.Tensor) -> Sequence[torch.Tensor]:
         r = self.replication_factor
         n = idxs.shape[0]
         idxs = torch.atleast_1d(idxs)
-        ranks = idxs * self.n_shards // size * self.replication_factor
+        ranks = idxs * self.n_shards // self.size * self.replication_factor
 
         idxs = idxs.unsqueeze(0).expand(r, n)
         ranks = ranks.unsqueeze(0).expand(r, n)
@@ -102,7 +105,7 @@ class RangeSharding(Sharding):
 
 
 if __name__ == "__main__":
-    sharding = RangeSharding(n_ranks=8, replication_factor=2)
+    sharding = RangeSharding(size=18, n_ranks=8, replication_factor=2)
     idxs = torch.arange(18)
-    print(sharding.get_full(size=18))
-    print(sharding.map(idxs, size=18))
+    print(sharding.get_full())
+    print(sharding.map(idxs))

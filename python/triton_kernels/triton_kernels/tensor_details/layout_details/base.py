@@ -1,29 +1,24 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Sequence
 
 
 @dataclass(frozen=True)
 class LayoutTransformation(ABC):
-
     shape: list[int]
     is_fp4: bool
 
     @abstractmethod
-    def swizzle_data(self, data):
-        pass
+    def swizzle_data(self, data): ...
 
     @abstractmethod
-    def unswizzle_data(self, data):
-        pass
+    def unswizzle_data(self, data): ...
 
 
 @dataclass(frozen=True)
 class Layout(ABC):
+    @abstractmethod
+    def make_transformation(self, shape: list[int]) -> LayoutTransformation: ...
 
     @abstractmethod
-    def make_transformation(self, shape: list[int]) -> LayoutTransformation:
-        pass
-
-    @abstractmethod
-    def swizzle_block_shape(self, block_shape):
-        pass
+    def swizzle_block_shape(self, block_shape: Sequence[int]) -> Sequence[int]: ...
