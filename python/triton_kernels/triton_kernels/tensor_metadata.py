@@ -6,7 +6,7 @@ from typing import Sequence
 import torch
 
 from .tensor_details.dtype import FloatType, IntegerType
-from .tensor_details.sharding import Sharding, ShardLocation
+from .tensor_details.sharding import LocalSharding, Sharding, ShardLocation
 
 
 @dataclass(kw_only=True)
@@ -14,6 +14,7 @@ class TensorSharding:
     dim: int
     sharding: Sharding
     sharding_size: int
+    max_dim_size: int | None = None
 
     def full_map(self) -> Sequence[ShardLocation]:
         return self.sharding.full_map(self.sharding_size)
@@ -21,8 +22,16 @@ class TensorSharding:
     def map(self, idxs: torch.Tensor) -> torch.Tensor:
         return self.sharding.map(idxs, self.sharding_size)
 
-    def range_for_rank(self, rank: int) -> slice:
-        return self.sharding.range_for_rank(rank, self.sharding_size)
+    def range_for_rank(self, rank: int, clamp: bool = True) -> slice:
+        s = self.sharding.range_for_rank(rank, self.sharding_size)
+        assert s.step in (1, None)
+        if clamp and self.max_dim_size is not None:
+            return (
+                slice(0, 0)
+                if s.start >= self.max_dim_size
+                else slice(s.start, min(s.stop, self.max_dim_size))
+            )
+        return s
 
     @property
     def uniform_width(self) -> int | None:
@@ -32,13 +41,17 @@ class TensorSharding:
     def is_fully_replicated(self) -> bool:
         return self.sharding.is_fully_replicated
 
+    @property
+    def is_local(self) -> bool:
+        return self.sharding.is_local
+
 
 @dataclass(kw_only=True)
 class TensorMetadata:
     dtype: IntegerType | FloatType
     shape: list[int | torch.Tensor] | None
     # Maximum size in each dimension. Note: shape_max[i] >= shape[i] if the shape is known
-    # statically on dimension.
+    # statically on dimension i.
     shape_max: list[int | None] | None = None
 
     sharding: InitVar[Sharding | None] = None
@@ -95,10 +108,32 @@ class TensorMetadata:
                 self.dynamic_dims.append(i)
 
         if sharding is not None:
+            assert not sharding.is_local, (
+                "Do not use LocalSharding directly; use get_sharding_local_if_unset() if needed"
+            )
             if sharding_dim < 0 or sharding_dim >= len(self.shape):
                 raise ValueError("sharding_dim out of range")
+            s = self.shape[sharding_dim]
+            smax = self.shape_max[sharding_dim]
             self.tensor_sharding = TensorSharding(
                 dim=sharding_dim,
                 sharding=sharding,
-                sharding_size=self.shape_max[sharding_dim],
+                sharding_size=smax,
+                max_dim_size=s if is_int(s) and s < smax else None,
             )
+
+
+def get_sharding_local_if_unset(t: TensorMetadata, dim: int) -> TensorSharding:
+    if ts := t.tensor_sharding:
+        if dim != ts.dim:
+            raise ValueError(f"Tensor is already sharded along dimension {ts.dim}")
+        return ts
+
+    s = t.shape[dim]
+    smax = t.shape_max[dim]
+    return TensorSharding(
+        dim=dim,
+        sharding=LocalSharding(),
+        sharding_size=smax,
+        max_dim_size=s if isinstance(s, int) and s < smax else None,
+    )

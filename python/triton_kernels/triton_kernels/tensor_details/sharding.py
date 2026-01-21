@@ -4,7 +4,7 @@ from typing import Sequence
 
 import torch
 
-from .placement import ProcessGroup, default_process_group
+from triton_kernels.distributed import Mesh, default_mesh, local_mesh
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -15,7 +15,7 @@ class ShardLocation:
 
 @dataclass(frozen=True, kw_only=True)
 class Sharding(ABC):
-    process_group: ProcessGroup = field(default_factory=default_process_group)
+    mesh: Mesh = field(default=default_mesh())
 
     @abstractmethod
     def full_map(self, size: int) -> Sequence[ShardLocation]:
@@ -43,22 +43,36 @@ class Sharding(ABC):
     def uniform_width(self, size: int) -> int | None:
         return None
 
+    @property
+    def is_local(self) -> bool:
+        return False
 
-@dataclass(frozen=True, kw_only=True)
+
+@dataclass(frozen=True, kw_only=True, init=False)
 class LocalSharding(Sharding):
+    def __init__(self):
+        super().__init__(mesh=local_mesh())
+
     def full_map(self, size: int) -> Sequence[ShardLocation]:
         return (ShardLocation(shard=slice(0, size)),)
 
     def map(self, idxs: torch.Tensor, size: int) -> torch.Tensor:
-        my_rank = self.process_group.rank
-        ranks = torch.full_like(idxs, my_rank)
+        ranks = torch.zeros_like(idxs)
         return torch.stack((ranks, idxs), dim=1).unsqueeze(0)
 
     def range_for_rank(self, rank: int, size: int) -> slice:
-        return slice(0, size if rank == self.process_group.rank else 0)
+        return slice(0, size)
 
     def uniform_width(self, size: int) -> int | None:
-        return size if self.process_group.world_size == 1 else None
+        return size
+
+    @property
+    def is_local(self) -> bool:
+        return True
+
+    @property
+    def is_fully_replicated(self) -> bool:
+        return True
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -67,7 +81,7 @@ class RangeSharding(Sharding):
 
     @property
     def n_shards(self) -> int:
-        return self.process_group.world_size // self.replication_factor
+        return self.mesh.world_size // self.replication_factor
 
     @property
     def is_fully_replicated(self) -> bool:
@@ -82,7 +96,7 @@ class RangeSharding(Sharding):
     #      shards [r+1, s) will have size q
 
     def __post_init__(self):
-        assert self.process_group.world_size % self.replication_factor == 0
+        assert self.mesh.world_size % self.replication_factor == 0
 
     def full_map(self, size: int) -> Sequence[ShardLocation]:
         q, r = divmod(size, self.n_shards)

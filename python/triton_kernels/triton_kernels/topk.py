@@ -5,10 +5,11 @@ from triton_kernels.distributed import SymmetricMemoryPool
 from triton_kernels.module import Module
 from triton_kernels.tensor import SparseMatrix, Tensor, dtype_to_torch_dtype, wrap_torch_tensor
 from triton_kernels.tensor_details.dtype import BIT
+from triton_kernels.tensor_details.sharding import RangeSharding, Sharding
+from triton_kernels.tensor_metadata import get_sharding_local_if_unset
 from triton_kernels.tensor_types import Sharded, Unsharded
 from triton_kernels.topk_details._topk_backward import _topk_backward
 from triton_kernels.topk_details._topk_forward import _topk_forward
-from triton_kernels.tensor_details.sharding import RangeSharding, Sharding
 
 
 def make_empty(offset, shape, dtype, device, all_gather, symm_mem_pool):
@@ -39,21 +40,21 @@ def topk_forward(
 ):
     if not isinstance(x, Tensor):
         x_shape = [x.shape[0] if n_rows is None else n_rows, x.shape[1]]
-        x_shape_max = [x.shape[0], x.shape[1]]
         sharding: Sharding | None = None
         sharding_dim: int | None = None
 
         if all_gather:
             sharding = RangeSharding()
             sharding_dim = 0
+            x_shape[0] *= symm_mem_pool.mesh.world_size
 
-        x = wrap_torch_tensor(
-            x, shape=x_shape, shape_max=x_shape_max, sharding=sharding, sharding_dim=sharding_dim
-        )
+        x = wrap_torch_tensor(x, shape=x_shape, sharding=sharding, sharding_dim=sharding_dim)
     else:
         assert all_gather is None
 
-    all_gather = x.tensor_sharding is not None
+    tensor_sharding = get_sharding_local_if_unset(x, 0)
+    all_gather = not tensor_sharding.is_local
+
     cdiv = lambda a, b: (a + b - 1) // b
     BLOCK_M = 32
     BLOCK_N = 32
@@ -62,10 +63,21 @@ def topk_forward(
     assert len(x.shape) == 2
     assert x.shape_max[-1] < 32768
     assert dim == 1
-    n_rows, n_cols = x.shape
-    n_rows_max, _ = x.shape_max
+
+    rank = tensor_sharding.sharding.mesh.local_rank
+    s = tensor_sharding.range_for_rank(rank, clamp=False)
+    start_row_max, end_row_max = s.start, s.stop
+    n_rows_max = end_row_max - start_row_max
+
+    s = tensor_sharding.range_for_rank(rank, clamp=True)
+    start_row, end_row = s.start, s.stop
+    n_rows = end_row - start_row
+    assert start_row == start_row_max  # or else we're missing a full shard
+
+    _, n_cols = x.shape
+    n_rows_out_max, _ = x.shape_max
     dev = x.storage.data.device
-    n_rows_out_max = n_rows_max * symm_mem_pool.mesh.world_size if all_gather else n_rows_max
+
     # scratchpad tensors
     # NOTE: these are not returned
     y_vals_bufs, y_vals, offset = make_empty(
@@ -107,7 +119,7 @@ def topk_forward(
         bitmatrix_data.stride(1),  # output [bitmatrix]
         n_rows,
         n_cols,  # shapes
-        x.tensor_sharding.range_for_rank(symm_mem_pool.mesh.local_rank).start if all_gather else 0,
+        start_row,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,  # tunable parameter
         APPLY_SOFTMAX=apply_softmax,
@@ -116,7 +128,8 @@ def topk_forward(
     )
     if all_gather:
         symm_mem_pool.hdl.barrier(channel=0)
-    bitmatrix_shape = [n_rows * symm_mem_pool.mesh.world_size if all_gather else n_rows, n_cols]
+
+    bitmatrix_shape = x.shape[:]
     bitmatrix_shape_max = [n_rows_out_max, None]
     bitmatrix = wrap_torch_tensor(
         bitmatrix_data, dtype=BIT, shape=bitmatrix_shape, shape_max=bitmatrix_shape_max
