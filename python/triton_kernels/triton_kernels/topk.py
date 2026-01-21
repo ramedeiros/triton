@@ -1,32 +1,59 @@
 import torch
+
 import triton
-from triton_kernels.topk_details._topk_forward import _topk_forward
-from triton_kernels.topk_details._topk_backward import _topk_backward
-from triton_kernels.tensor import SparseMatrix, Tensor
-from triton_kernels.tensor_details.dtype import BIT
-from typing import Optional, Union
 from triton_kernels.distributed import SymmetricMemoryPool
-from triton_kernels.tensor import wrap_torch_tensor, dtype_to_torch_dtype
+from triton_kernels.module import Module
+from triton_kernels.tensor import SparseMatrix, Tensor, dtype_to_torch_dtype, wrap_torch_tensor
+from triton_kernels.tensor_details.dtype import BIT
+from triton_kernels.tensor_types import Sharded, Unsharded
+from triton_kernels.topk_details._topk_backward import _topk_backward
+from triton_kernels.topk_details._topk_forward import _topk_forward
+from triton_kernels.tensor_details.sharding import RangeSharding, Sharding
 
 
 def make_empty(offset, shape, dtype, device, all_gather, symm_mem_pool):
     dtype = dtype_to_torch_dtype(dtype)
     if all_gather:
         rank_id = symm_mem_pool.mesh.local_rank
-        ret_bufs = symm_mem_pool.make_empty(shape=shape, dtype=dtype, region="topk", region_offset=offset)
+        ret_bufs = symm_mem_pool.make_empty(
+            shape=shape, dtype=dtype, region="topk", region_offset=offset
+        )
         ret = ret_bufs[rank_id]
-        offset = symm_mem_pool.align_up(offset + ret.numel() * ret.element_size(),
-                                        symm_mem_pool.regions["topk"].alignment)
+        offset = symm_mem_pool.align_up(
+            offset + ret.numel() * ret.element_size(), symm_mem_pool.regions["topk"].alignment
+        )
         return ret_bufs, ret, offset
     ret = torch.empty(shape, dtype=dtype, device=device)
-    return (ret, ), ret, 0
+    return (ret,), ret, 0
 
 
-def topk_forward(x, k, apply_softmax=True, dim=1, y_indx=None, n_rows=None, all_gather=False, symm_mem_pool=None):
+def topk_forward(
+    x,
+    k,
+    apply_softmax=True,
+    dim=1,
+    y_indx=None,
+    n_rows=None,
+    all_gather: bool | None = None,
+    symm_mem_pool=None,
+):
     if not isinstance(x, Tensor):
         x_shape = [x.shape[0] if n_rows is None else n_rows, x.shape[1]]
         x_shape_max = [x.shape[0], x.shape[1]]
-        x = wrap_torch_tensor(x, shape=x_shape, shape_max=x_shape_max)
+        sharding: Sharding | None = None
+        sharding_dim: int | None = None
+
+        if all_gather:
+            sharding = RangeSharding()
+            sharding_dim = 0
+
+        x = wrap_torch_tensor(
+            x, shape=x_shape, shape_max=x_shape_max, sharding=sharding, sharding_dim=sharding_dim
+        )
+    else:
+        assert all_gather is None
+
+    all_gather = x.tensor_sharding is not None
     cdiv = lambda a, b: (a + b - 1) // b
     BLOCK_M = 32
     BLOCK_N = 32
@@ -37,39 +64,63 @@ def topk_forward(x, k, apply_softmax=True, dim=1, y_indx=None, n_rows=None, all_
     assert dim == 1
     n_rows, n_cols = x.shape
     n_rows_max, _ = x.shape_max
-    dev = x.device
+    dev = x.storage.data.device
     n_rows_out_max = n_rows_max * symm_mem_pool.mesh.world_size if all_gather else n_rows_max
     # scratchpad tensors
     # NOTE: these are not returned
-    y_vals_bufs, y_vals, offset = make_empty(0, (n_rows_out_max, k), x.dtype, dev, all_gather=all_gather,
-                                             symm_mem_pool=symm_mem_pool)
+    y_vals_bufs, y_vals, offset = make_empty(
+        0, (n_rows_out_max, k), x.dtype, dev, all_gather=all_gather, symm_mem_pool=symm_mem_pool
+    )
     if y_indx is None:
-        y_indx_bufs, y_indx, offset = make_empty(offset, (n_rows_out_max, k), torch.int16, dev, all_gather=all_gather,
-                                                 symm_mem_pool=symm_mem_pool)
+        y_indx_bufs, y_indx, offset = make_empty(
+            offset,
+            (n_rows_out_max, k),
+            torch.int16,
+            dev,
+            all_gather=all_gather,
+            symm_mem_pool=symm_mem_pool,
+        )
     else:
-        y_indx_bufs = (y_indx, )
+        y_indx_bufs = (y_indx,)
     # create bitmatrix in transposed memory layout:
     n_cols_pad = cdiv(n_cols, BLOCK_N) * BLOCK_N
     n_cols_words = n_cols_pad // 32
-    bitmatrix_bufs, bitmatrix_data, offset = make_empty(offset, (n_cols_words, cdiv(n_rows_out_max, 32) * 32),
-                                                        torch.uint32, dev, all_gather=all_gather,
-                                                        symm_mem_pool=symm_mem_pool)
+    bitmatrix_bufs, bitmatrix_data, offset = make_empty(
+        offset,
+        (n_cols_words, cdiv(n_rows_out_max, 32) * 32),
+        torch.uint32,
+        dev,
+        all_gather=all_gather,
+        symm_mem_pool=symm_mem_pool,
+    )
     bitmatrix_data = torch.transpose(bitmatrix_data, 0, 1)[:n_rows_max]
     pids = cdiv(n_rows_max, BLOCK_M)
-    _topk_forward[(pids, )](
-        x.storage.data, x.stride(0),  # inputs
-        y_vals_bufs, y_indx_bufs, y_vals.stride(0), use_provided_indx,  # output [topk]
-        bitmatrix_bufs, bitmatrix_data.stride(0), bitmatrix_data.stride(1),  # output [bitmatrix]
-        n_rows, n_cols,  # shapes
-        symm_mem_pool.mesh.local_rank * n_rows_max if all_gather else 0, BLOCK_M=BLOCK_M,
+    _topk_forward[(pids,)](
+        x.storage.data,
+        x.storage.data.stride(0),  # inputs
+        y_vals_bufs,
+        y_indx_bufs,
+        y_vals.stride(0),
+        use_provided_indx,  # output [topk]
+        bitmatrix_bufs,
+        bitmatrix_data.stride(0),
+        bitmatrix_data.stride(1),  # output [bitmatrix]
+        n_rows,
+        n_cols,  # shapes
+        x.tensor_sharding.range_for_rank(symm_mem_pool.mesh.local_rank).start if all_gather else 0,
+        BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,  # tunable parameter
-        APPLY_SOFTMAX=apply_softmax, N_EXPTS_PAD=n_cols_pad, N_EXPTS_ACT=k,  # constants
+        APPLY_SOFTMAX=apply_softmax,
+        N_EXPTS_PAD=n_cols_pad,
+        N_EXPTS_ACT=k,  # constants
     )
     if all_gather:
         symm_mem_pool.hdl.barrier(channel=0)
     bitmatrix_shape = [n_rows * symm_mem_pool.mesh.world_size if all_gather else n_rows, n_cols]
     bitmatrix_shape_max = [n_rows_out_max, None]
-    bitmatrix = wrap_torch_tensor(bitmatrix_data, dtype=BIT, shape=bitmatrix_shape, shape_max=bitmatrix_shape_max)
+    bitmatrix = wrap_torch_tensor(
+        bitmatrix_data, dtype=BIT, shape=bitmatrix_shape, shape_max=bitmatrix_shape_max
+    )
     return y_vals, y_indx, bitmatrix
 
 
@@ -77,19 +128,37 @@ def topk_backward(x, y_indx, dy_vals, k, n_rows, apply_softmax):
     assert dy_vals.shape[-1] == k
     n_expts_pad = triton.next_power_of_2(x.shape[-1])
     dx = torch.empty_like(x)
-    _topk_backward[(dy_vals.shape[0], )](
-        y_indx, y_indx.stride(0), dy_vals, dy_vals.stride(0), x, x.stride(0),  # inputs
+    _topk_backward[(dy_vals.shape[0],)](
+        y_indx,
+        y_indx.stride(0),
+        dy_vals,
+        dy_vals.stride(0),
+        x,
+        x.stride(0),  # inputs
         dx,  # outputs
-        dx.stride(0), x.shape[0], n_rows, x.shape[-1], APPLY_SOFTMAX=apply_softmax, N_EXPTS_ACT=k,
-        N_EXPTS_PAD=n_expts_pad)
+        dx.stride(0),
+        x.shape[0],
+        n_rows,
+        x.shape[-1],
+        APPLY_SOFTMAX=apply_softmax,
+        N_EXPTS_ACT=k,
+        N_EXPTS_PAD=n_expts_pad,
+    )
     return dx
 
 
-class TopK(torch.autograd.Function):
+class TopK(Module):
+    TYPES = {
+        # x must be either unsharded or sharded along the 0 (not expert) dimension
+        # sharding must be uniform
+        "x": Unsharded() | Sharded(0, uniform=True),
+    }
 
     @staticmethod
     def forward(ctx, x, k, apply_softmax, dim, y_indx, n_rows, all_gather, symm_mem_pool):
-        y_vals, y_indx, bitmatrix = topk_forward(x, k, apply_softmax, dim, y_indx, n_rows, all_gather, symm_mem_pool)
+        y_vals, y_indx, bitmatrix = topk_forward(
+            x, k, apply_softmax, dim, y_indx, n_rows, all_gather, symm_mem_pool
+        )
         ctx.save_for_backward(x, y_indx)
         ctx.apply_softmax = apply_softmax
         ctx.k = k
@@ -104,13 +173,13 @@ class TopK(torch.autograd.Function):
 
 
 def topk(
-    x: Union[Tensor, torch.Tensor],
+    x: Tensor | torch.Tensor,
     k: int,
     apply_softmax: bool = True,
     dim: int = 1,
-    y_indx: Optional[torch.Tensor] = None,
-    n_rows: Optional[int] = None,
-    all_gather: bool = False,
+    y_indx: torch.Tensor | None = None,
+    n_rows: int | None = None,
+    all_gather: bool | None = None,
     symm_mem_pool: SymmetricMemoryPool | None = None,
 ):
     """
@@ -137,7 +206,9 @@ def topk(
     -------
     SparseMatrix: sparse matrix equal to `x` with non-selected entries set to 0
     """
-    y_vals, y_indx, bitmatrix = TopK.apply(x, k, apply_softmax, dim, y_indx, n_rows, all_gather, symm_mem_pool)
+    y_vals, y_indx, bitmatrix = TopK.apply(
+        x, k, apply_softmax, dim, y_indx, n_rows, all_gather, symm_mem_pool
+    )
     return SparseMatrix(vals=y_vals, indx=y_indx, mask=bitmatrix)
 
 
@@ -146,8 +217,8 @@ def topk_torch(
     k,
     apply_softmax: bool = True,
     dim: int = 1,
-    y_indx: Optional[torch.Tensor] = None,
-    n_rows: Optional[int] = None,
+    y_indx: torch.Tensor | None = None,
+    n_rows: int | None = None,
 ) -> SparseMatrix:
     if n_rows is None:
         n_rows = x.shape[0]
@@ -164,8 +235,10 @@ def topk_torch(
     y_indx = y_indx.int()
     # compute bitmatrix
     _, n_cols = x.shape
-    bitmatrix_data = torch.zeros((cdiv(n_cols, 32), cdiv(x.shape[0], 32) * 32), dtype=torch.int32, device=device)
-    bitmatrix_data = torch.transpose(bitmatrix_data, 0, 1)[:x.shape[0]]
+    bitmatrix_data = torch.zeros(
+        (cdiv(n_cols, 32), cdiv(x.shape[0], 32) * 32), dtype=torch.int32, device=device
+    )
+    bitmatrix_data = torch.transpose(bitmatrix_data, 0, 1)[: x.shape[0]]
     # fill bitmatrix
     if apply_softmax:
         y_vals = torch.softmax(y_vals.float(), dim=-1).to(x.dtype)
@@ -173,9 +246,11 @@ def topk_torch(
         y_indx, sort_indices = torch.sort(y_indx, dim=1)
         y_vals = torch.gather(y_vals, 1, sort_indices)
     y_indx[n_rows:, :] = -1
-    rows = torch.arange(x.shape[0], device=device).unsqueeze(1).expand(-1, y_indx.shape[1]).reshape(-1)
+    rows = (
+        torch.arange(x.shape[0], device=device).unsqueeze(1).expand(-1, y_indx.shape[1]).reshape(-1)
+    )
     cols = y_indx.reshape(-1)  # 64-bit safe for div/mod
-    word_idx = torch.div(cols, 32, rounding_mode='floor')
+    word_idx = torch.div(cols, 32, rounding_mode="floor")
     bit_idx = cols % 32
     masks = torch.ones_like(bit_idx) << bit_idx
     bitmatrix_data.index_put_((rows, word_idx), masks, accumulate=True)

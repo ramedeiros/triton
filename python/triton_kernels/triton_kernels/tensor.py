@@ -1,5 +1,5 @@
-from dataclasses import dataclass, field
-from typing import Literal, Sequence
+from dataclasses import dataclass
+from typing import Any, Literal, Sequence
 
 import torch
 
@@ -20,12 +20,11 @@ from .tensor_details.dtype import (
     FP64,
     UINT8,
     DataType,
-    FloatType,
-    IntegerType,
 )
 from .tensor_details.layout import BlackwellMXValueLayout, Layout, StridedLayout
 from .tensor_details.ragged_tensor import RaggedTensorMetadata
 from .tensor_details.sharding import Sharding
+from .tensor_metadata import TensorMetadata
 
 
 # storage
@@ -49,80 +48,48 @@ class Storage:
 
 
 @dataclass
-class TensorSharding:
-    dim: int
-    sharding: Sharding
-
-
-@dataclass
-class Tensor:
+class Tensor(TensorMetadata):
     storage: Storage
-    dtype: IntegerType | FloatType
-    shape: list[int | torch.Tensor]
 
-    # Maximum size in each dimension. Note: shape_max[i] >= shape[i] if the shape is known
-    # statically on dimension i.
-    shape_max: list[int | None] | None = None
-    sharding: TensorSharding | None
-
-    # Dimension indidces whose sizes are not known at compile time.
-    dynamic_dims: list[int] = field(init=False)
-
-    def __post_init__(self):
-        assert isinstance(self.storage, Storage)
-
-        # initialize shape
-        if self.shape is None:
-            if self.dtype.bitwidth < 8:
-                raise ValueError("shape must be provided for sub-byte types")
-            if self.sharding is not None:
-                raise ValueError("shape must be provided if sharding")
-            self.shape = self.storage.data.shape
-
-        self.shape = list(self.shape)
-
-        # validate shape: all elements must be `int` or numel-1 `torch.Tensor`
-        is_int = lambda s: isinstance(s, int)
-        is_item = lambda s: hasattr(s, "numel") and s.numel() == 1
-        assert all(is_int(s) or is_item(s) for s in self.shape)
-
-        # initialize shape_max
-        if self.shape_max is None:
-            self.shape_max = [None] * len(self.shape)
-        elif len(self.shape) != len(self.shape_max):
-            raise ValueError(f"Mismatched shape ({len(self.shape)}) / shape_max ({len(self.shape_max)}) lengths")
-
-        self.dynamic_dims = []
-        for i, (s, smax) in enumerate(zip(self.shape, self.shape_max)):
-            if is_int(s):
-                if smax is None:
-                    self.shape_max[i] = s
-                elif s > smax:
-                    raise ValueError(f"shape[{i}]={s} > shape_max[{i}]={smax}")
-            else:
-                if smax is None:
-                    raise ValueError(f"shape_max[{i}] may only be None for static shapes")
-                self.dynamic_dims.append(i)
-
-    # torch compatibility layer
     @property
-    def ndim(self):
-        return len(self.shape)
+    def sharding_dim(self) -> int | None:
+        return self.sharding.dim if self.sharding is not None else None
+
+    def __post_init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__post_init__(*args, default_shape=self.storage.data.shape, **kwargs)
+
+        # TODO: validate dtype compatibility between storage and metadata, this needs
+        # to be format-aware.
 
     def element_size(self):
         return self.dtype.bitwidth // 8
 
     @property
-    def data(self) -> torch.Tensor:
-        return self.storage.data
-
-    def dim(self):
-        return self.ndim
+    def ndim(self):
+        return len(self.shape)
 
     def size(self, i=None):
         if i is None:
             return self.shape
         return self.shape[i]
+
+    # TODO: get rid of these, fix callers to refer to self.storage.data directly
+    @property
+    def data(self) -> torch.Tensor:
+        return self.storage.data
+
+    @property
+    def device(self):
+        return self.storage.data.device
+
+    def stride(self, i=None):
+        return self.storage.data.stride(i)
+
+    def data_ptr(self):
+        return self.storage.data.data_ptr()
+
+    def numel(self):
+        return self.storage.data.numel()
 
 
 def is_tma_compliant(tensor: Tensor) -> bool:
@@ -146,7 +113,9 @@ def is_tma_compliant(tensor: Tensor) -> bool:
     return all(compliant)
 
 
-def make_dense_tma(tensor: Tensor, block_shape: Sequence[int], is_scale: bool = False) -> TensorDescriptor:
+def make_dense_tma(
+    tensor: Tensor, block_shape: Sequence[int], is_scale: bool = False
+) -> TensorDescriptor:
     storage = tensor.storage
     strides = list(storage.data.stride())
     shape = list(storage.data.shape)
@@ -169,7 +138,10 @@ def make_dense_tma(tensor: Tensor, block_shape: Sequence[int], is_scale: bool = 
 
 
 def make_tma(
-    tensor: Tensor, block_shape: Sequence[int], mode: Literal["dense", "gather", "scatter"], is_scale: bool = False
+    tensor: Tensor,
+    block_shape: Sequence[int],
+    mode: Literal["dense", "gather", "scatter"],
+    is_scale: bool = False,
 ) -> TensorDescriptor:
     if mode in ["dense", "gather", "scatter"]:
         return make_dense_tma(tensor, block_shape, is_scale)
@@ -235,14 +207,24 @@ class SparseMatrix:
 # ---------------------------------------------------------------------------- #
 
 
-def wrap_torch_tensor(torch_tensor, dtype=None, shape=None, shape_max=None, layout=None):
+def wrap_torch_tensor(
+    torch_tensor: torch.Tensor,
+    dtype: torch.dtype | DataType | None = None,
+    shape: list[int] | None = None,
+    shape_max: list[int] | None = None,
+    layout: Layout | None = None,
+    sharding: Sharding | None = None,
+    sharding_dim: int | None = None,
+):
     if dtype is None:
         dtype = torch_tensor.dtype
     dtype = torch_dtype_to_dtype(dtype)
     if shape is None:
         shape = list(torch_tensor.shape)
         if dtype == FP4:
-            shape[torch_tensor.stride().index(1)] *= (8 * torch_tensor.dtype.itemsize) // dtype.bitwidth
+            shape[torch_tensor.stride().index(1)] *= (
+                8 * torch_tensor.dtype.itemsize
+            ) // dtype.bitwidth
     if shape_max is None:
         shape_max = list(shape)
     if layout is None:
@@ -250,7 +232,14 @@ def wrap_torch_tensor(torch_tensor, dtype=None, shape=None, shape_max=None, layo
         # This is consistent with how we expand `shape` for packed sub-byte dtypes.
         major_dim = torch_tensor.stride().index(1) if 1 in torch_tensor.stride() else -1
         layout = StridedLayout(major_dim=major_dim - torch_tensor.ndim)
-    return Tensor(Storage(torch_tensor, layout), dtype=dtype, shape=shape, shape_max=shape_max)
+    return Tensor(
+        storage=Storage(torch_tensor, layout),
+        dtype=dtype,
+        shape=shape,
+        shape_max=shape_max,
+        sharding=sharding,
+        sharding_dim=sharding_dim,
+    )
 
 
 def convert_layout(tensor: Tensor, layout: Layout, **layout_transformation_kwargs):
@@ -259,10 +248,16 @@ def convert_layout(tensor: Tensor, layout: Layout, **layout_transformation_kwarg
     transformation = tensor.storage.layout.make_transformation(shape, tensor.dtype == FP4)
     canonical_data = transformation.unswizzle_data(tensor.storage.data)
     # convert canonical form to `layout`
-    transformation = layout.make_transformation(shape, tensor.dtype == FP4, **layout_transformation_kwargs)
+    transformation = layout.make_transformation(
+        shape, tensor.dtype == FP4, **layout_transformation_kwargs
+    )
     # print("convert layout ", torch.cuda.memory_summary(0, abbreviated=True))
     new_data = transformation.swizzle_data(canonical_data)
-    return Tensor(Storage(new_data, layout), shape=list(tensor.shape), dtype=tensor.dtype)
+    return Tensor(
+        storage=Storage(new_data, layout),
+        shape=list(tensor.shape),
+        dtype=tensor.dtype,
+    )
 
 
 def dtype_to_torch_dtype(dtype: DataType) -> torch.dtype:
@@ -283,7 +278,7 @@ def dtype_to_torch_dtype(dtype: DataType) -> torch.dtype:
     }[dtype]
 
 
-def torch_dtype_to_dtype(dtype: torch.dtype) -> DataType:
+def torch_dtype_to_dtype(dtype: torch.dtype | DataType) -> DataType:
     if isinstance(dtype, DataType):
         return dtype
     id = str(dtype).split(".")[-1]
